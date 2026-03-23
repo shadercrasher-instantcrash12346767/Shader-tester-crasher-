@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Volume Shader</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; width: 100vw; height: 100vh; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #info {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(255,255,255,0.4);
+    font-family: monospace;
+    font-size: 11px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    pointer-events: none;
+  }
+  #fps {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    color: rgba(255,255,255,0.6);
+    font-family: monospace;
+    font-size: 13px;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="fps">-- FPS</div>
+<div id="info">volume shader · gpu stress test</div>
+
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+
+if (!gl) {
+  document.body.innerHTML = '<div style="color:white;display:flex;align-items:center;justify-content:center;height:100vh;font-family:monospace">WebGL not supported</div>';
+  throw new Error('no webgl');
+}
+
+const VS = `
+attribute vec2 a_pos;
+void main() {
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+`;
+
+const FS = `
+precision highp float;
+
+uniform vec2 u_res;
+uniform float u_time;
+
+#define STEPS 96
+#define STEP_SIZE 0.025
+#define PI 3.14159265
+
+float hash(vec3 p) {
+  p = fract(p * vec3(443.897, 441.423, 437.195));
+  p += dot(p, p.yxz + 19.19);
+  return fract((p.x + p.y) * p.z);
+}
+
+float noise(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  f = f*f*(3.0-2.0*f);
+  return mix(
+    mix(mix(hash(i), hash(i+vec3(1,0,0)), f.x),
+        mix(hash(i+vec3(0,1,0)), hash(i+vec3(1,1,0)), f.x), f.y),
+    mix(mix(hash(i+vec3(0,0,1)), hash(i+vec3(1,0,1)), f.x),
+        mix(hash(i+vec3(0,1,1)), hash(i+vec3(1,1,1)), f.x), f.y),
+    f.z
+  );
+}
+
+float fbm(vec3 p) {
+  float v = 0.0;
+  float a = 0.5;
+  vec3 shift = vec3(100.0);
+  for (int i = 0; i < 6; i++) {
+    v += a * noise(p);
+    p = p * 2.0 + shift;
+    a *= 0.5;
+  }
+  return v;
+}
+
+vec3 palette(float t) {
+  vec3 a = vec3(0.5, 0.5, 0.5);
+  vec3 b = vec3(0.5, 0.5, 0.5);
+  vec3 c = vec3(1.0, 1.0, 1.0);
+  vec3 d = vec3(0.00, 0.33, 0.67);
+  return a + b * cos(2.0 * PI * (c * t + d));
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * u_res) / min(u_res.x, u_res.y);
+
+  float t = u_time * 0.3;
+
+  // Camera setup
+  vec3 ro = vec3(sin(t) * 2.5, cos(t * 0.7) * 1.5, cos(t) * 2.5);
+  vec3 ta = vec3(0.0, 0.0, 0.0);
+  vec3 ww = normalize(ta - ro);
+  vec3 uu = normalize(cross(ww, vec3(0.0, 1.0, 0.0)));
+  vec3 vv = cross(uu, ww);
+  vec3 rd = normalize(uv.x * uu + uv.y * vv + 1.5 * ww);
+
+  // Volumetric raymarching
+  vec3 col = vec3(0.0);
+  float transmittance = 1.0;
+  vec3 pos = ro;
+
+  for (int i = 0; i < STEPS; i++) {
+    pos += rd * STEP_SIZE;
+
+    float len = length(pos);
+    if (len > 3.0) break;
+
+    // Density field
+    vec3 q = pos + vec3(0.0, 0.0, u_time * 0.1);
+    float density = fbm(q * 1.5 + vec3(u_time * 0.05)) - 0.45;
+    density = max(0.0, density);
+
+    // Swirling warp
+    vec3 q2 = pos;
+    q2.xz = mat2(cos(t), -sin(t), sin(t), cos(t)) * q2.xz;
+    float density2 = fbm(q2 * 2.0 + u_time * 0.08) - 0.4;
+    density2 = max(0.0, density2);
+
+    density = mix(density, density2, 0.4);
+    density *= 0.8;
+
+    if (density > 0.001) {
+      // Emission color
+      float phase = fbm(pos * 3.0 + u_time * 0.15);
+      vec3 emitColor = palette(phase + u_time * 0.05);
+
+      // Inner glow
+      float glow = exp(-len * 0.8) * 2.0;
+      emitColor += vec3(0.3, 0.6, 1.0) * glow;
+
+      float absorption = density * 3.5;
+      float scattering = density * 2.0;
+
+      col += transmittance * scattering * emitColor;
+      transmittance *= exp(-absorption * STEP_SIZE);
+
+      if (transmittance < 0.01) break;
+    }
+  }
+
+  // Background nebula
+  float bg = fbm(rd * 2.0 + u_time * 0.02) * 0.15;
+  col += palette(bg + u_time * 0.03) * bg * (1.0 - transmittance * 0.5);
+
+  // Tone mapping + vignette
+  col = col / (col + 1.0);
+  col = pow(col, vec3(0.4545));
+
+  vec2 vigUV = gl_FragCoord.xy / u_res;
+  float vig = vigUV.x * vigUV.y * (1.0 - vigUV.x) * (1.0 - vigUV.y);
+  col *= pow(vig * 15.0, 0.3);
+
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(sh));
+    return null;
+  }
+  return sh;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, 'a_pos');
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const uRes = gl.getUniformLocation(prog, 'u_res');
+const uTime = gl.getUniformLocation(prog, 'u_time');
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+resize();
+window.addEventListener('resize', resize);
+
+let startTime = performance.now();
+let frames = 0;
+let lastFps = performance.now();
+const fpsEl = document.getElementById('fps');
+
+function render() {
+  const now = performance.now();
+  const t = (now - startTime) / 1000;
+
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uTime, t);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  frames++;
+  if (now - lastFps >= 1000) {
+    fpsEl.textContent = frames + ' FPS';
+    frames = 0;
+    lastFps = now;
+  }
+
+  requestAnimationFrame(render);
+}
+render();
+</script>
+</body>
+</html>
